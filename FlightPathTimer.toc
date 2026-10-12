@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: |cff66ccffFlightPath|cffffffffTimer
+## Notes: Shows flight times on the flight map tooltip and a countdown while flying.
+## Author: Soul
+## Version: 1.0.0
+## SavedVariables: FlightPathTimerDB
+## OptionalDeps: FlightTracker
+
+FlightPathTimer.lua
