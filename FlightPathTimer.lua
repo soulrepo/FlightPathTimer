@@ -12,7 +12,7 @@ local PENDING_TIMEOUT = 10
 
 local DB
 local pending     -- { origin, dest, distance, continent, hops, at } between click and takeoff
-local flight      -- { origin, dest, distance, continent, start, duration, known }
+local flight      -- { origin, dest, distance, continent, start, duration, known, source }
 
 local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffFlightPathTimer|r: " .. msg)
@@ -74,6 +74,51 @@ local function PathDistance(index)
     return 0, 1
 end
 
+-- The taxi map node whose position is closest to (x, y): hop endpoints sit on node positions.
+local function NodeAt(x, y)
+    local best, bestD
+    for i = 1, NumTaxiNodes() do
+        local nx, ny = TaxiNodePosition(i)
+        local dx, dy = nx - x, ny - y
+        local d = dx * dx + dy * dy
+        if not bestD or d < bestD then best, bestD = i, d end
+    end
+    return best
+end
+
+-- Time for one leg from FlightPathData.lua. A name can map to several node ids (Alliance and
+-- Horde nodes in the same town), so try each pair.
+local function LegTime(from, to)
+    local data = FlightPathTimerData
+    local a, b = data and data.nodes[from], data and data.nodes[to]
+    if not a or not b then return nil end
+    for i = 1, table.getn(a) do
+        for j = 1, table.getn(b) do
+            local t = data.legs[a[i] .. "-" .. b[j]]
+            if t then return t end
+        end
+    end
+    return nil
+end
+
+-- Flight time along the route the map shows, summed leg by leg from the game's path data.
+-- Returns nil when any leg is missing (for example a node added after the data was generated).
+local function RouteDataTime(index)
+    local hops = GetNumRoutes and GetNumRoutes(index)
+    if not hops or hops < 1 or not TaxiGetSrcX then return nil end
+    local total = 0
+    local from = NodeAt(TaxiGetSrcX(index, 1), TaxiGetSrcY(index, 1))
+    for h = 1, hops do
+        local to = NodeAt(TaxiGetDestX(index, h), TaxiGetDestY(index, h))
+        if not from or not to then return nil end
+        local t = LegTime(TaxiNodeName(from), TaxiNodeName(to))
+        if not t then return nil end
+        total = total + t
+        from = to
+    end
+    return total
+end
+
 -------------------------------------------------------------------------------
 -- Duration lookup
 -------------------------------------------------------------------------------
@@ -100,12 +145,16 @@ local function RateFor(continent)
     return DEFAULT_RATE
 end
 
--- Returns duration, isExact, source ("flown", "return", "flighttracker" or "distance")
-local function GetFlightTime(origin, dest, distance, continent)
+-- Returns duration, isExact, source ("flown", "route", "return", "flighttracker" or "distance").
+-- routeTime is the time worked out from the game's own flight path data (see RouteDataTime).
+local function GetFlightTime(origin, dest, distance, continent, routeTime)
+    local t, source
     if origin and dest then
-        local t, source = LookupRecorded(origin, dest)
-        if t then return t, source == "flown", source end
+        t, source = LookupRecorded(origin, dest)
+        if source == "flown" then return t, true, source end
     end
+    if routeTime then return routeTime, false, "route" end
+    if t then return t, false, source end
     if distance and distance > 0 then
         return distance * RateFor(continent), false, "distance"
     end
@@ -113,6 +162,7 @@ local function GetFlightTime(origin, dest, distance, continent)
 end
 
 local ESTIMATE_LABEL = {
+    route = "from flight path data",
     ["return"] = "estimate from return flight",
     flighttracker = "estimate from FlightTracker",
     distance = "estimate",
@@ -194,7 +244,7 @@ timer:SetScript("OnUpdate", function()
     local elapsed = GetTime() - flight.start
     if flight.duration and flight.duration > 0 then
         local remaining = flight.duration - elapsed
-        local prefix = flight.known and "" or "~"
+        local prefix = (flight.known or flight.source == "route") and "" or "~"
         if remaining >= 0 then
             this.text:SetText(prefix .. FormatTime(remaining) .. " remaining")
         else
@@ -221,10 +271,10 @@ end
 local function StartFlight()
     local p = pending
     pending = nil
-    local duration, known = GetFlightTime(p.origin, p.dest, p.distance, p.continent)
+    local duration, known, source = GetFlightTime(p.origin, p.dest, p.distance, p.continent, p.routeTime)
     flight = {
         origin = p.origin, dest = p.dest, distance = p.distance, continent = p.continent,
-        start = GetTime(), duration = duration, known = known,
+        start = GetTime(), duration = duration, known = known, source = source,
     }
     DB.active = flight  -- survives /reload mid-flight
     ShowTimer()
@@ -251,7 +301,7 @@ local function EndFlight()
 
     if f.duration and f.duration > 0 and DB.verbose then
         Print(string.format("Landed at %s in %s (expected %s%s).", f.dest, FormatTime(duration),
-            f.known and "" or "~", FormatTime(f.duration)))
+            (f.known or f.source == "route") and "" or "~", FormatTime(f.duration)))
     end
 end
 
@@ -291,6 +341,7 @@ local function HookTaxiMap()
                 dest = TaxiNodeName(index),
                 distance = distance,
                 hops = hops,
+                routeTime = RouteDataTime(index),
                 continent = CurrentContinent(),
                 at = GetTime(),
             }
@@ -306,10 +357,13 @@ local function HookTaxiMap()
         if not index or TaxiNodeGetType(index) ~= "REACHABLE" then return end
 
         local distance, hops = PathDistance(index)
-        local duration, known, source = GetFlightTime(CurrentNodeName(), TaxiNodeName(index), distance, CurrentContinent())
+        local duration, known, source = GetFlightTime(CurrentNodeName(), TaxiNodeName(index), distance,
+            CurrentContinent(), RouteDataTime(index))
         if duration then
             if known then
                 GameTooltip:AddLine("Flight time: " .. FormatTime(duration), 0.4, 0.8, 1)
+            elseif source == "route" then
+                GameTooltip:AddLine("Flight time: " .. FormatTime(duration) .. " (" .. ESTIMATE_LABEL[source] .. ")", 1, 1, 1)
             else
                 GameTooltip:AddLine("Flight time: ~" .. FormatTime(duration) .. " (" .. ESTIMATE_LABEL[source] .. ")", 0.7, 0.7, 0.7)
             end
