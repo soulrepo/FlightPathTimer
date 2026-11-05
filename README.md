@@ -8,8 +8,12 @@ Flight path times for the octowow 1.12 client (Interface 11200).
   time, a FlightTracker time, or the route length on the map.
 - **In-flight timer:** a small bar with the destination and a countdown. On a route with no
   recorded time it counts up instead. Survives `/reload` mid-flight.
-- **Learns as you fly:** every landed flight is saved, and its speed tunes the estimates for
-  the rest of that continent. Times recorded by the FlightTracker addon are used as estimates.
+- **Learns as you fly:** every landed flight is saved, and so is the real time of each leg.
+  The server doesn't always fly the path the game data describes (Stormwind to Ironforge is
+  about 40 seconds shorter), so learned leg times replace the data for every route that uses
+  them. A multi-stop flight teaches its legs when all but one are already known, or in one go
+  with SuperWoW, which lets the addon see when you pass each stop. Times recorded by the
+  FlightTracker addon are used as estimates.
 
 ## Install
 

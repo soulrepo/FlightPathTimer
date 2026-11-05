@@ -12,7 +12,9 @@ local PENDING_TIMEOUT = 10
 
 local DB
 local pending     -- { origin, dest, distance, continent, hops, at } between click and takeoff
-local flight      -- { origin, dest, distance, continent, start, duration, known, source }
+local flight      -- { origin, dest, distance, continent, start, duration, known, source, legs, marks }
+-- Within this many yards of a stop counts as passing it (needs SuperWoW's UnitPosition).
+local PASS_DISTANCE = 100
 
 local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffFlightPathTimer|r: " .. msg)
@@ -86,37 +88,71 @@ local function NodeAt(x, y)
     return best
 end
 
--- Time for one leg from FlightPathData.lua. A name can map to several node ids (Alliance and
--- Horde nodes in the same town), so try each pair.
+-- Time for one leg, and whether it was learned from your own flights. Learned times win over the
+-- game data because the server does not always fly the path the client's data describes
+-- (Stormwind -> Ironforge is about 40s shorter than its data says).
+-- A name can map to several node ids (Alliance and Horde nodes in the same town), so try each pair.
 local function LegTime(from, to)
+    local learned = DB.legs[RouteKey(from, to)]
+    if learned then return learned, true end
     local data = FlightPathTimerData
     local a, b = data and data.nodes[from], data and data.nodes[to]
     if not a or not b then return nil end
     for i = 1, table.getn(a) do
         for j = 1, table.getn(b) do
             local t = data.legs[a[i] .. "-" .. b[j]]
-            if t then return t end
+            if t then return t, false end
         end
     end
     return nil
 end
 
--- Flight time along the route the map shows, summed leg by leg from the game's path data.
--- Returns nil when any leg is missing (for example a node added after the data was generated).
-local function RouteDataTime(index)
+-- The legs of the route the map shows for a destination: { { from, to, t, learned }, ... }
+local function RouteLegs(index)
     local hops = GetNumRoutes and GetNumRoutes(index)
     if not hops or hops < 1 or not TaxiGetSrcX then return nil end
-    local total = 0
+    local legs = {}
     local from = NodeAt(TaxiGetSrcX(index, 1), TaxiGetSrcY(index, 1))
     for h = 1, hops do
         local to = NodeAt(TaxiGetDestX(index, h), TaxiGetDestY(index, h))
         if not from or not to then return nil end
-        local t = LegTime(TaxiNodeName(from), TaxiNodeName(to))
-        if not t then return nil end
-        total = total + t
+        local fromName, toName = TaxiNodeName(from), TaxiNodeName(to)
+        local t, learned = LegTime(fromName, toName)
+        table.insert(legs, { from = fromName, to = toName, t = t, learned = learned })
         from = to
     end
-    return total
+    return legs
+end
+
+-- Total time of a route's legs, and whether every leg was learned from your flights.
+-- Returns nil when any leg has no time (for example a node added after the data was generated).
+local function LegsTotal(legs)
+    if not legs then return nil end
+    local total, allLearned = 0, true
+    for i = 1, table.getn(legs) do
+        if not legs[i].t then return nil end
+        total = total + legs[i].t
+        if not legs[i].learned then allLearned = false end
+    end
+    return total, allLearned
+end
+
+-- World position of a flight point from FlightPathData.lua, nearest to (x, y) when a name has
+-- several ids.
+local function NodeDistance(name, x, y)
+    local data = FlightPathTimerData
+    local ids = data and data.pos and data.nodes[name]
+    if not ids then return nil end
+    local best
+    for i = 1, table.getn(ids) do
+        local p = data.pos[ids[i]]
+        if p then
+            local dx, dy = p[1] - x, p[2] - y
+            local d = math.sqrt(dx * dx + dy * dy)
+            if not best or d < best then best = d end
+        end
+    end
+    return best
 end
 
 -------------------------------------------------------------------------------
@@ -145,15 +181,15 @@ local function RateFor(continent)
     return DEFAULT_RATE
 end
 
--- Returns duration, isExact, source ("flown", "route", "return", "flighttracker" or "distance").
--- routeTime is the time worked out from the game's own flight path data (see RouteDataTime).
-local function GetFlightTime(origin, dest, distance, continent, routeTime)
+-- Returns duration, isExact, source ("flown", "legs", "route", "return", "flighttracker" or "distance").
+-- routeTime is the sum of the route's legs (see RouteLegs); routeLearned says every leg was learned.
+local function GetFlightTime(origin, dest, distance, continent, routeTime, routeLearned)
     local t, source
     if origin and dest then
         t, source = LookupRecorded(origin, dest)
         if source == "flown" then return t, true, source end
     end
-    if routeTime then return routeTime, false, "route" end
+    if routeTime then return routeTime, false, routeLearned and "legs" or "route" end
     if t then return t, false, source end
     if distance and distance > 0 then
         return distance * RateFor(continent), false, "distance"
@@ -162,6 +198,7 @@ local function GetFlightTime(origin, dest, distance, continent, routeTime)
 end
 
 local ESTIMATE_LABEL = {
+    legs = "from your flights, leg by leg",
     route = "from flight path data",
     ["return"] = "estimate from return flight",
     flighttracker = "estimate from FlightTracker",
@@ -244,7 +281,7 @@ timer:SetScript("OnUpdate", function()
     local elapsed = GetTime() - flight.start
     if flight.duration and flight.duration > 0 then
         local remaining = flight.duration - elapsed
-        local prefix = (flight.known or flight.source == "route") and "" or "~"
+        local prefix = (flight.known or flight.source == "route" or flight.source == "legs") and "" or "~"
         if remaining >= 0 then
             this.text:SetText(prefix .. FormatTime(remaining) .. " remaining")
         else
@@ -271,13 +308,70 @@ end
 local function StartFlight()
     local p = pending
     pending = nil
-    local duration, known, source = GetFlightTime(p.origin, p.dest, p.distance, p.continent, p.routeTime)
+    local routeTime, routeLearned = LegsTotal(p.legs)
+    local duration, known, source = GetFlightTime(p.origin, p.dest, p.distance, p.continent, routeTime, routeLearned)
     flight = {
         origin = p.origin, dest = p.dest, distance = p.distance, continent = p.continent,
         start = GetTime(), duration = duration, known = known, source = source,
+        legs = p.legs, marks = {},
     }
     DB.active = flight  -- survives /reload mid-flight
     ShowTimer()
+end
+
+local function Round1(x)
+    return math.floor(x * 10 + 0.5) / 10
+end
+
+-- Save the real time of each leg of a landed flight, so later routes through it use it.
+local function LearnLegs(f, duration)
+    local legs = f.legs
+    if not legs then return end
+    local n = table.getn(legs)
+    if n == 1 then
+        DB.legs[RouteKey(legs[1].from, legs[1].to)] = Round1(duration)
+        return
+    end
+    -- Passed every stop (SuperWoW): split the flight at the moments we passed them.
+    if f.marks and table.getn(f.marks) == n - 1 then
+        local prev = f.start
+        for i = 1, n do
+            local t = f.marks[i] or (f.start + duration)
+            DB.legs[RouteKey(legs[i].from, legs[i].to)] = Round1(t - prev)
+            prev = t
+        end
+        return
+    end
+    -- Otherwise, if exactly one leg has no learned time, it gets what the others leave over.
+    local unknown, rest = nil, duration
+    for i = 1, n do
+        local learned = DB.legs[RouteKey(legs[i].from, legs[i].to)]
+        if learned then
+            rest = rest - learned
+        elseif unknown then
+            return
+        else
+            unknown = i
+        end
+    end
+    local leg = unknown and legs[unknown]
+    if leg and leg.t and rest > leg.t * 0.5 and rest < leg.t * 1.5 then
+        DB.legs[RouteKey(leg.from, leg.to)] = Round1(rest)
+    end
+end
+
+-- Note the moment we pass each stop of a multi-stop flight.
+local function CheckStops()
+    local f = flight
+    if not f or not f.legs or not UnitPosition then return end
+    local k = table.getn(f.marks) + 1
+    if k >= table.getn(f.legs) then return end
+    local x, y = UnitPosition("player")
+    if not x then return end
+    local d = NodeDistance(f.legs[k].to, x, y)
+    if d and d < PASS_DISTANCE then
+        f.marks[k] = GetTime()
+    end
 end
 
 local function EndFlight()
@@ -291,6 +385,7 @@ local function EndFlight()
     if duration < MIN_RECORD_SECONDS then return end
 
     DB.flights[RouteKey(f.origin, f.dest)] = math.floor(duration + 0.5)
+    LearnLegs(f, duration)
 
     if f.distance and f.distance > 0 and f.continent then
         local r = DB.rates[f.continent] or { time = 0, dist = 0 }
@@ -301,7 +396,7 @@ local function EndFlight()
 
     if f.duration and f.duration > 0 and DB.verbose then
         Print(string.format("Landed at %s in %s (expected %s%s).", f.dest, FormatTime(duration),
-            (f.known or f.source == "route") and "" or "~", FormatTime(f.duration)))
+            (f.known or f.source == "route" or f.source == "legs") and "" or "~", FormatTime(f.duration)))
     end
 end
 
@@ -321,7 +416,7 @@ monitor:SetScript("OnUpdate", function()
             pending = nil
         end
     elseif flight then
-        if not onTaxi then EndFlight() end
+        if onTaxi then CheckStops() else EndFlight() end
     else
         this:Hide()
     end
@@ -341,7 +436,7 @@ local function HookTaxiMap()
                 dest = TaxiNodeName(index),
                 distance = distance,
                 hops = hops,
-                routeTime = RouteDataTime(index),
+                legs = RouteLegs(index),
                 continent = CurrentContinent(),
                 at = GetTime(),
             }
@@ -357,12 +452,13 @@ local function HookTaxiMap()
         if not index or TaxiNodeGetType(index) ~= "REACHABLE" then return end
 
         local distance, hops = PathDistance(index)
+        local routeTime, routeLearned = LegsTotal(RouteLegs(index))
         local duration, known, source = GetFlightTime(CurrentNodeName(), TaxiNodeName(index), distance,
-            CurrentContinent(), RouteDataTime(index))
+            CurrentContinent(), routeTime, routeLearned)
         if duration then
             if known then
                 GameTooltip:AddLine("Flight time: " .. FormatTime(duration), 0.4, 0.8, 1)
-            elseif source == "route" then
+            elseif source == "route" or source == "legs" then
                 GameTooltip:AddLine("Flight time: " .. FormatTime(duration) .. " (" .. ESTIMATE_LABEL[source] .. ")", 1, 1, 1)
             else
                 GameTooltip:AddLine("Flight time: ~" .. FormatTime(duration) .. " (" .. ESTIMATE_LABEL[source] .. ")", 0.7, 0.7, 0.7)
@@ -388,6 +484,7 @@ events:SetScript("OnEvent", function()
         DB = FlightPathTimerDB
         DB.flights = DB.flights or {}
         DB.rates = DB.rates or {}
+        DB.legs = DB.legs or {}
         if DB.showTimer == nil then DB.showTimer = true end
         if DB.locked == nil then DB.locked = false end
         if DB.verbose == nil then DB.verbose = false end
@@ -432,6 +529,7 @@ SlashCmdList["FLIGHTPATHTIMER"] = function(msg)
     elseif msg == "reset" then
         DB.flights = {}
         DB.rates = {}
+        DB.legs = {}
         Print("Forgot all recorded flight times.")
     else
         local n = 0
